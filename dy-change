@@ -1,0 +1,1197 @@
+import { Injectable, Optional } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model, Types } from 'mongoose';
+import { FieldConfig } from '../field-config/field-config.schema';
+import { TestCase } from '../test-cases/test-case.schema';
+import { ExecutionProgressGateway, LogEntry } from './execution-progress.gateway';
+import { HtmlReportService } from './html-report.service';
+import * as path from 'path';
+import * as fs from 'fs';
+
+const ARTIFACTS_DIR = path.join(process.cwd(), 'artifacts', 'live');
+
+/**
+ * Execution logger — collects logs and emits them in real-time via WebSocket.
+ * Emits to both runId and projectId rooms so frontend can subscribe with either.
+ */
+class ExecutionLogger {
+  private logs: LogEntry[] = [];
+  private startTime = Date.now();
+
+  constructor(
+    private runId: string,
+    private gateway?: ExecutionProgressGateway,
+    private projectId?: string,
+  ) {}
+
+  log(step: number, level: LogEntry['level'], message: string, opts?: { selector?: string; details?: string; duration?: number }) {
+    const entry: LogEntry = {
+      timestamp: new Date().toISOString(),
+      step,
+      level,
+      message,
+      selector: opts?.selector,
+      details: opts?.details,
+      duration: opts?.duration,
+    };
+    this.logs.push(entry);
+    // Emit to runId room
+    this.gateway?.emitLog(this.runId, entry);
+    // Also emit to projectId room (frontend may subscribe with projectId)
+    if (this.projectId && this.projectId !== this.runId) {
+      this.gateway?.emitLog(this.projectId, entry);
+    }
+  }
+
+  info(step: number, message: string, opts?: { selector?: string; details?: string }) {
+    this.log(step, 'info', message, opts);
+  }
+
+  wait(step: number, message: string, opts?: { selector?: string; details?: string }) {
+    this.log(step, 'wait', message, opts);
+  }
+
+  action(step: number, message: string, opts?: { selector?: string; details?: string; duration?: number }) {
+    this.log(step, 'action', message, opts);
+  }
+
+  success(step: number, message: string, opts?: { duration?: number; details?: string }) {
+    this.log(step, 'success', message, opts);
+  }
+
+  error(step: number, message: string, opts?: { selector?: string; details?: string }) {
+    this.log(step, 'error', message, opts);
+  }
+
+  warn(step: number, message: string, opts?: { details?: string }) {
+    this.log(step, 'warn', message, opts);
+  }
+
+  getElapsed(): number {
+    return Date.now() - this.startTime;
+  }
+
+  getAllLogs(): LogEntry[] {
+    return this.logs;
+  }
+}
+
+function formatError(msg: string): string {
+  if (!msg) return 'Unknown error';
+  if (msg.includes('No visible element')) return 'Element exists but is hidden. If this is a wizard step, the previous "Next" click may not have advanced the form.';
+  if (msg.includes('Timeout')) return 'Element not found or not clickable. The page may not have loaded correctly.';
+  if (msg.includes('net::ERR')) return 'Page failed to load. Check URL and network.';
+  if (msg.includes('strict mode violation')) return 'Multiple matching elements — selector is ambiguous. Update in Field Manager.';
+  if (msg.includes('selectOption')) return 'Dropdown option not found. Check the value matches available options.';
+  if (msg.includes('fill')) return 'Could not fill field. It may be disabled or hidden.';
+  return msg.split('\n')[0].slice(0, 150);
+}
+
+/**
+ * Resolve the Page object from a ctx that may be either a Page or a Frame.
+ * Frames expose .page(); Pages don't.
+ */
+function pageOf(ctx: any, fallbackPage: any): any {
+  try {
+    if (typeof ctx.page === 'function') return ctx.page();
+  } catch {}
+  return fallbackPage || ctx;
+}
+
+/**
+ * APP-READINESS FIX (values were being filled before the page finished loading):
+ *
+ * `networkidle` alone is the WRONG readiness signal for jQuery apps, for two
+ * reasons:
+ *   1. The cascade AJAX often starts AFTER we check — legacy code defers the
+ *      request (setTimeout inside the change handler), so at the moment we ask
+ *      "is the network idle?" the request hasn't even started. networkidle
+ *      resolves instantly and the next step fires while the dependent dropdown
+ *      is still empty and the page is mid-render.
+ *   2. Rendering continues after the network finishes — the response arrives,
+ *      THEN jQuery builds DOM, selectpickers refresh, overlays fade out.
+ *
+ * For a Bootstrap + jQuery stack the authoritative signal is jQuery's OWN
+ * in-flight request counter: `jQuery.active === 0`. This helper waits until,
+ * for TWO consecutive checks (a quiet period):
+ *   - document.readyState === 'complete'
+ *   - jQuery.active === 0 (when jQuery exists)
+ *   - no visible loading indicators (blockUI overlays, spinners, loaders)
+ * A small initial grace period lets freshly-triggered (deferred) AJAX actually
+ * START before we begin checking, closing the setTimeout race in (1).
+ */
+async function waitForAppReady(page: any, opts?: { timeout?: number; graceMs?: number }) {
+  const timeout = opts?.timeout ?? 15000;
+  const grace = opts?.graceMs ?? 400;
+  const deadline = Date.now() + timeout;
+
+  // Grace: give deferred handlers (setTimeout-launched AJAX) time to START
+  try { await page.waitForTimeout(grace); } catch {}
+
+  let consecutiveReady = 0;
+  while (Date.now() < deadline) {
+    let ready = false;
+    try {
+      ready = await page.evaluate(() => {
+        // 1. Document fully loaded (scripts, images)
+        if (document.readyState !== 'complete') return false;
+
+        // 2. jQuery has no in-flight AJAX requests — the definitive signal
+        //    for jQuery-driven cascades
+        const jq = (window as any).jQuery || (window as any).$;
+        if (jq && typeof jq.active === 'number' && jq.active > 0) return false;
+
+        // 3. No VISIBLE loading indicators (blockUI, common spinner/loader
+        //    conventions). Visibility check via offsetParent/rects so hidden
+        //    templates don't block forever.
+        const isVisible = (el: any) =>
+          !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+        const indicators = document.querySelectorAll(
+          '.blockUI, .blockOverlay, .blockMsg, .loading, .loader, .spinner, ' +
+          '.spinner-border, .spinner-grow, .fa-spinner, .fa-circle-notch, ' +
+          '.loading-overlay, .page-loader, .preloader, #loading, #loader, ' +
+          '#preloader, [class*="loading-spinner"]',
+        );
+        for (const el of Array.from(indicators)) {
+          if (isVisible(el)) return false;
+        }
+        return true;
+      });
+    } catch {
+      // evaluate can fail mid-navigation — treat as not ready and retry
+      ready = false;
+    }
+
+    if (ready) {
+      consecutiveReady++;
+      // Require the ready state to HOLD across two checks (~500ms quiet
+      // period) — a single snapshot can land in the gap between two chained
+      // AJAX calls (State loads → then City request fires).
+      if (consecutiveReady >= 2) return;
+    } else {
+      consecutiveReady = 0;
+    }
+    try { await page.waitForTimeout(250); } catch {}
+  }
+  // Timed out — proceed anyway; per-action waits (option retry, visible-element
+  // polling) provide the next layer of protection.
+}
+
+/**
+ * Smart wait: waits for the page AND the app to become stable.
+ * Network idle (bounded) → DOM parsed → jQuery/spinner quiet period.
+ */
+async function waitForPageStable(page: any, opts?: { timeout?: number }) {
+  const timeout = opts?.timeout || 15000;
+  try {
+    // Wait for network to be idle (no inflight requests for 500ms)
+    await page.waitForLoadState('networkidle', { timeout: Math.min(timeout, 10000) }).catch(() => {});
+  } catch {}
+  try {
+    // Ensure DOM content is fully parsed
+    await page.waitForLoadState('domcontentloaded', { timeout: 5000 });
+  } catch {}
+  // App-level readiness: jQuery.active === 0, spinners gone, quiet period held
+  await waitForAppReady(page, { timeout: Math.min(timeout, 12000) });
+}
+
+/**
+ * Wizard-safe element resolution: find the first VISIBLE element matching a
+ * selector. Wizard/multi-step forms keep every step panel in the DOM and hide
+ * the inactive ones, so a recorded selector can match several elements — only
+ * the current step's one is visible. Playwright's waitForSelector waits on the
+ * FIRST DOM match (possibly hidden) and would hang; this polls ALL matches.
+ */
+async function firstVisibleElement(ctx: any, selector: string, timeout: number): Promise<any> {
+  const deadline = Date.now() + timeout;
+  let lastCount = 0;
+  while (Date.now() < deadline) {
+    try {
+      const els = await ctx.$$(selector);
+      lastCount = els.length;
+      for (const el of els) {
+        try {
+          if (await el.isVisible()) return el;
+        } catch {}
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  if (lastCount > 0) {
+    throw new Error(`Timeout: No visible element among ${lastCount} match(es) for selector: ${selector}`);
+  }
+  throw new Error(`Timeout: element not found for selector: ${selector}`);
+}
+
+/**
+ * Smart element wait: waits for a matching element to be ready and RETURNS its handle.
+ *  - state 'visible' (default): returns the first VISIBLE match (wizard-safe).
+ *  - state 'attached': returns the first match present in the DOM (hidden file
+ *    inputs etc.).
+ * Callers act on the RETURNED HANDLE, not by re-querying the selector, so
+ * multi-match selectors always operate on the element we actually validated.
+ */
+async function waitForElementReady(ctx: any, selector: string, opts?: { timeout?: number; state?: 'visible' | 'attached' }): Promise<any> {
+  const timeout = opts?.timeout || 20000;
+  const state = opts?.state || 'visible';
+
+  if (state === 'attached') {
+    return await ctx.waitForSelector(selector, { state: 'attached', timeout });
+  }
+  return await firstVisibleElement(ctx, selector, timeout);
+}
+
+/**
+ * Smart click: resolves the first VISIBLE match (wizard-safe), clicks it, then
+ * waits for the page AND app to settle. Element-handle clicks keep Playwright's
+ * actionability checks (enabled, stable, not obscured).
+ */
+async function smartClick(ctx: any, page: any, selector: string, opts?: { timeout?: number }) {
+  const timeout = opts?.timeout || 20000;
+
+  const el = await firstVisibleElement(ctx, selector, timeout);
+  try { await el.scrollIntoViewIfNeeded(); } catch {}
+  await el.click({ timeout: Math.min(timeout, 10000) });
+
+  // After click, wait for page + app to settle (navigation, AJAX, re-renders,
+  // spinners). Grace period inside covers deferred/setTimeout-launched AJAX.
+  await waitForPageStable(page, { timeout: 12000 });
+}
+
+/**
+ * Smart fill: waits for input to be ready then fills.
+ *
+ * Handles legacy/enterprise stacks:
+ *  - Multi-step forms: the same input selector can match hidden inputs on other
+ *    step panels — we resolve the visible one first.
+ *  - Bootstrap datepicker inputs are frequently `readonly` (typing is blocked and
+ *    Playwright's fill() throws "element is not editable"). We detect that, set the
+ *    value directly, and fire input/change/blur so the widget (and jQuery validation)
+ *    picks it up, then close the calendar popup with Escape.
+ *  - jQuery-driven widgets that only react to `$(el).trigger('change')`.
+ */
+async function smartFill(ctx: any, selector: string, value: string, opts?: { timeout?: number }) {
+  const timeout = opts?.timeout || 20000;
+
+  // Wait for the element to at least exist in the DOM
+  await ctx.waitForSelector(selector, { state: 'attached', timeout });
+
+  // Prefer the VISIBLE match when the selector hits multiple elements across
+  // step panels. Fall back to the first attached match (readonly datepicker /
+  // hidden input path below handles it via JS).
+  let el: any = null;
+  try {
+    el = await firstVisibleElement(ctx, selector, Math.min(timeout, 8000));
+  } catch {
+    el = await ctx.$(selector);
+  }
+  if (!el) throw new Error(`Element not found for selector: ${selector}`);
+
+  // Bootstrap datepickers are commonly readonly — plain fill() would fail
+  const isReadonly = await el
+    .evaluate((node: any) => node.hasAttribute('readonly') || node.readOnly === true)
+    .catch(() => false);
+
+  const isVisible = await el.isVisible().catch(() => false);
+
+  if (!isReadonly && isVisible) {
+    try {
+      await el.fill(value, { timeout: Math.min(timeout, 8000) });
+      // Notify jQuery-based widgets/validation that the value changed
+      await el.evaluate((node: any) => {
+        node.dispatchEvent(new Event('input', { bubbles: true }));
+        node.dispatchEvent(new Event('change', { bubbles: true }));
+        const jq = (window as any).jQuery;
+        if (jq) { try { jq(node).trigger('change').trigger('blur'); } catch {} }
+      });
+      // A datepicker popup often opens on focus — dismiss it so it doesn't block later steps
+      try { await el.press('Escape'); } catch {}
+      return;
+    } catch {
+      // fall through to JS-based assignment (readonly toggled at runtime, masked input, etc.)
+    }
+  }
+
+  // Readonly input (datepicker), hidden input, or fill() failed → assign value via JS
+  await el.evaluate((node: any, val: string) => {
+    const wasReadonly = node.hasAttribute('readonly');
+    if (wasReadonly) node.removeAttribute('readonly');
+    node.value = val;
+    node.dispatchEvent(new Event('input', { bubbles: true }));
+    node.dispatchEvent(new Event('change', { bubbles: true }));
+    const jq = (window as any).jQuery;
+    if (jq) { try { jq(node).val(val).trigger('change').trigger('blur'); } catch {} }
+    if (wasReadonly) node.setAttribute('readonly', 'readonly');
+  }, value);
+  try { await el.press('Escape'); } catch {}
+}
+
+/**
+ * Smart select: selects an option in a dropdown.
+ *
+ * Supports four cases:
+ *  1. Plain native <select> — uses Playwright's selectOption (by label, then value).
+ *  2. Enhanced select (Select2 / Chosen / bootstrap-select) — the real <select> is
+ *     hidden, so we set the value on the underlying element and trigger jQuery
+ *     `change` so the widget re-renders its visible label.
+ *  2b. bootstrap-select (selectpicker) UI fallback — drive the widget through its
+ *     UI: toggle button → live-search box → click the option.
+ *  3. Fully custom dropdown — opens the widget, types into its search box if
+ *     present, and clicks the option whose text matches.
+ *
+ * Dependent (cascading) dropdowns: the option-match RETRIES for up to 12s while
+ * the dependent options arrive via AJAX, and after every applied selection we
+ * wait for full app readiness (jQuery.active === 0, spinners gone) so the NEXT
+ * dependent field's data is loaded before its step runs.
+ */
+async function smartSelect(ctx: any, page: any, selector: string, value: string, opts?: { timeout?: number }) {
+  const timeout = opts?.timeout || 20000;
+  const pg = pageOf(ctx, page);
+
+  await ctx.waitForSelector(selector, { state: 'attached', timeout });
+
+  // Wizard-safe: among multiple matches, pick the "active" one — either the
+  // select itself is visible, or (enhanced selects are display:none) its widget
+  // wrapper is visible. Fall back to the first match.
+  let handle: any = null;
+  try {
+    const els = await ctx.$$(selector);
+    for (const el of els) {
+      const activeHere = await el
+        .evaluate((node: any) => {
+          const visible = (n: any) => !!(n && (n.offsetWidth || n.offsetHeight || n.getClientRects().length));
+          if (visible(node)) return true;
+          // Enhanced select: check the wrapper the widget rendered next to it
+          const wrapper = node.closest && (node.closest('.bootstrap-select') || node.closest('.select2') || node.closest('.chosen-container'));
+          if (wrapper && visible(wrapper)) return true;
+          // Select2 v4 renders the container as a SIBLING after the select
+          const sib = node.nextElementSibling;
+          if (sib && /select2|bootstrap-select|chosen/i.test(sib.className || '') && visible(sib)) return true;
+          return false;
+        })
+        .catch(() => false);
+      if (activeHere) { handle = el; break; }
+    }
+    if (!handle && els.length > 0) handle = els[0];
+  } catch {}
+  if (!handle) throw new Error(`Element not found for selector: ${selector}`);
+
+  const tagName = await handle.evaluate((el: any) => el.tagName.toLowerCase()).catch(() => '');
+
+  if (tagName === 'select') {
+    const isVisible = await handle.isVisible().catch(() => false);
+
+    // Case 1: plain visible native select. Playwright's selectOption internally
+    // retries until the option exists, so late AJAX-loaded options are covered
+    // by its own timeout.
+    if (isVisible) {
+      try { await handle.selectOption({ label: value }, { timeout: Math.min(timeout, 10000) }); return; } catch {}
+      try { await handle.selectOption(value, { timeout: Math.min(timeout, 10000) }); return; } catch {}
+    }
+
+    // Case 2: enhanced select whose native element is hidden (Select2 / Chosen /
+    // selectpicker). Match the option by value OR visible text (recorder stores
+    // the visible text), set it on the real <select>, then notify BOTH native
+    // and jQuery listeners AND call each widget's refresh API so its visible
+    // label updates. Retries for up to 12s so a dependent dropdown's
+    // AJAX-loaded options have time to arrive.
+    const tryApply = () =>
+      handle.evaluate((el: any, val: string) => {
+        const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const target = norm(val);
+        const options = Array.from(el.options) as any[];
+        const match =
+          options.find((o) => o.value === val) ||
+          options.find((o) => norm(o.textContent) === target) ||
+          options.find((o) => norm(o.textContent).includes(target) && target.length > 0);
+        if (!match) return false;
+
+        el.value = match.value;
+        match.selected = true;
+
+        // Native listeners
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+
+        const jq = (window as any).jQuery || (window as any).$;
+        if (jq) {
+          try {
+            const $el = jq(el);
+            $el.val(match.value);
+            // jQuery change (Select2 v4 + app cascade handlers listen here)
+            $el.trigger('change');
+            // Select2-specific namespaced event (some versions/configs require it)
+            try { $el.trigger('change.select2'); } catch {}
+            // bootstrap-select: refresh the rendered button text
+            if (typeof $el.selectpicker === 'function') {
+              try { $el.selectpicker('refresh'); } catch {}
+            }
+            // Chosen: notify it to re-render
+            try { $el.trigger('chosen:updated'); } catch {}
+          } catch {}
+        }
+        return true;
+      }, value);
+
+    let applied = await tryApply();
+    if (!applied) {
+      const matchDeadline = Date.now() + Math.min(timeout, 12000);
+      while (!applied && Date.now() < matchDeadline) {
+        try { await pg.waitForTimeout(500); } catch {}
+        applied = await tryApply();
+      }
+    }
+
+    if (applied) {
+      // The selection's change handler fires the cascade AJAX for the NEXT
+      // dependent field. Wait for full APP readiness — grace period so the
+      // (often deferred) request starts, then jQuery.active === 0 and spinners
+      // gone with a quiet period — before the next step runs.
+      await waitForAppReady(pg, { timeout: 12000, graceMs: 500 });
+      return;
+    }
+
+    // Case 2b: bootstrap-select UI drive. The option wasn't found in the native
+    // <select> even after waiting (options may load only when the dropdown
+    // opens, or the recorded text differs slightly) — operate the widget the
+    // way a user does: open the toggle button, type in the live-search box,
+    // click the option.
+    const wrapperHandle = await handle.evaluateHandle((el: any) => el.closest('.bootstrap-select')).catch(() => null);
+    const wrapperEl = wrapperHandle ? wrapperHandle.asElement && wrapperHandle.asElement() : null;
+    if (wrapperEl) {
+      try {
+        // Open the dropdown
+        const toggle = await wrapperEl.$('button.dropdown-toggle');
+        if (toggle) await toggle.click({ timeout: 5000 });
+
+        // Type in the live-search box if the select uses data-live-search
+        const search = await wrapperEl.$('.bs-searchbox input');
+        if (search) {
+          try {
+            await search.fill(value, { timeout: 3000 });
+            // Let live-search filter the option list
+            await pg.waitForTimeout(400);
+          } catch {}
+        }
+
+        // Bootstrap 4/5 open menu: .dropdown-menu.show — Bootstrap 3: .bootstrap-select.open
+        // Try EXACT text match first so "Delhi" doesn't accidentally click "New Delhi",
+        // then fall back to substring match. Scope to THIS widget's wrapper.
+        const bsOptionSelectors = [
+          `.dropdown-menu li a:text-is("${value}")`,
+          `.dropdown-menu li a:has-text("${value}")`,
+        ];
+        for (const optSel of bsOptionSelectors) {
+          const opt = await wrapperEl.$(optSel);
+          if (opt && (await opt.isVisible().catch(() => false))) {
+            await opt.click({ timeout: 4000 });
+            // Wait for cascade AJAX triggered by the selection
+            await waitForAppReady(pg, { timeout: 12000, graceMs: 500 });
+            return;
+          }
+        }
+
+        // Nothing matched — close the open menu so it doesn't block later steps
+        try { await pg.keyboard.press('Escape'); } catch {}
+      } catch {}
+    }
+  }
+
+  // Case 3: custom dropdown widget → open it, search, and click the matching option
+  try { await handle.click({ timeout: Math.min(timeout, 6000) }); } catch {}
+
+  // Some searchable widgets render their search box only after opening
+  const searchBox = ctx
+    .locator('.select2-search__field, .bs-searchbox input, .chosen-search input, .dropdown-menu.show input[type="search"]')
+    .first();
+  if (await searchBox.count().catch(() => 0)) {
+    try {
+      await searchBox.fill(value, { timeout: 3000 });
+      try { await pg.waitForTimeout(400); } catch {}
+    } catch {}
+  }
+
+  const optionSelectors = [
+    `.select2-results__option:has-text("${value}")`,
+    `.chosen-results li:has-text("${value}")`,
+    // bootstrap-select option markup (li > a), exact match first
+    `.bootstrap-select .dropdown-menu li a:text-is("${value}")`,
+    `.bootstrap-select .dropdown-menu li a:has-text("${value}")`,
+    `.dropdown-menu.show li:has-text("${value}")`,
+    `[role="option"]:has-text("${value}")`,
+  ];
+  for (const optSel of optionSelectors) {
+    const opt = ctx.locator(optSel).first();
+    if (await opt.count().catch(() => 0)) {
+      try {
+        await opt.click({ timeout: 4000 });
+        await waitForAppReady(pg, { timeout: 12000, graceMs: 500 });
+        return;
+      } catch {}
+    }
+  }
+
+  // Last resort: let Playwright's selectOption surface a clear, actionable error
+  await ctx.selectOption(selector, value, { timeout });
+}
+
+/**
+ * Smart navigation: navigates and waits for page + app to be fully ready.
+ */
+async function smartNavigate(page: any, url: string, opts?: { timeout?: number }) {
+  const timeout = opts?.timeout || 30000;
+
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+  await waitForPageStable(page, { timeout });
+}
+
+/**
+ * Find the correct frame/page context where a selector exists.
+ * Enterprise apps often use iframes for content areas after login.
+ */
+async function getContextForSelector(page: any, selector: string, xpath?: string): Promise<any> {
+  // First check main page with CSS selector
+  try {
+    const el = await page.$(selector);
+    if (el) return page;
+  } catch {}
+
+  // Try XPath on main page
+  if (xpath) {
+    try {
+      const el = await page.$(`xpath=${xpath}`);
+      if (el) return page;
+    } catch {}
+  }
+
+  // Check all frames with CSS selector
+  const frames = page.frames();
+  for (const frame of frames) {
+    try {
+      const el = await frame.$(selector);
+      if (el) return frame;
+    } catch {}
+  }
+
+  // Check all frames with XPath
+  if (xpath) {
+    for (const frame of frames) {
+      try {
+        const el = await frame.$(`xpath=${xpath}`);
+        if (el) return frame;
+      } catch {}
+    }
+  }
+
+  // Return main page as fallback (will trigger normal timeout error)
+  return page;
+}
+
+/**
+ * Resolve the working locator for a field — tries CSS selector first, falls back to XPath.
+ *
+ * Multi-step wizard handling: when the CSS selector matches MULTIPLE elements
+ * (one per step panel), we check whether exactly one of them is VISIBLE — if so,
+ * the CSS selector is still usable because every action helper resolves to the
+ * first visible match. Otherwise we fall back to the recorded XPath, which is
+ * indexed and points at the exact element from the recording.
+ */
+async function resolveSelector(ctx: any, selector: string, xpath?: string): Promise<string> {
+  // Try CSS selector first
+  try {
+    const elements = await ctx.$$(selector);
+    // If exactly one match, CSS selector is good
+    if (elements.length === 1) return selector;
+
+    if (elements.length > 1) {
+      // Multiple matches — count how many are visible right now
+      let visibleCount = 0;
+      for (const el of elements) {
+        try { if (await el.isVisible()) visibleCount++; } catch {}
+      }
+      // Exactly one visible (typical wizard: same button per step panel) → CSS is
+      // fine because action helpers pick the visible match.
+      if (visibleCount === 1) return selector;
+    }
+
+    // Zero matches, or multiple visible matches — prefer the recorded XPath
+    if (xpath) {
+      try {
+        const xpathElements = await ctx.$$(`xpath=${xpath}`);
+        if (xpathElements.length === 1) return `xpath=${xpath}`;
+      } catch {}
+    }
+
+    // If CSS found something but XPath also failed, still return CSS
+    // (action helpers will resolve to the first visible match)
+    if (elements.length > 0) return selector;
+  } catch {}
+
+  // CSS selector threw an error (invalid selector syntax etc.) — try XPath
+  if (xpath) {
+    try {
+      const el = await ctx.$(`xpath=${xpath}`);
+      if (el) return `xpath=${xpath}`;
+    } catch {}
+  }
+
+  // Return original selector as last resort (will trigger proper timeout error)
+  return selector;
+}
+
+@Injectable()
+export class DynamicStepService {
+  constructor(
+    @InjectModel(FieldConfig.name) private fieldModel: Model<FieldConfig>,
+    @InjectModel(TestCase.name) private testCaseModel: Model<TestCase>,
+    @Optional() private progressGateway?: ExecutionProgressGateway,
+    @Optional() private htmlReportService?: HtmlReportService,
+  ) {}
+
+  /**
+   * Build steps from field configs and execute them with Playwright
+   * No manual selectors needed — everything comes from FieldConfig DB
+   */
+  async executeWithDynamicFields(opts: {
+    projectId: string;
+    scriptId?: string;
+    url: string;
+    testData: Record<string, string>;
+    credentials?: { username: string; password: string };
+    runId?: string;
+    headless?: boolean;
+    screenshotMode?: 'all' | 'final' | 'none';
+    executionTarget?: 'local' | 'server';
+    serverWsEndpoint?: string;
+    shouldAbort?: () => boolean;
+    shouldPause?: () => boolean;
+  }) {
+    const fieldFilter: any = {
+      projectId: new Types.ObjectId(opts.projectId),
+      isActive: true,
+      isSkipped: false,
+    };
+
+    // If a specific scriptId is provided, only run that script's fields
+    if (opts.scriptId) {
+      fieldFilter.scriptId = new Types.ObjectId(opts.scriptId);
+    }
+
+    const fields = await this.fieldModel.find(fieldFilter).sort({ order: 1 }).lean();
+
+    const { chromium } = await import('playwright');
+    const isHeadless = opts.headless ?? (process.env.HEADLESS === 'true');
+
+    const runId = opts.runId || Date.now().toString();
+    const logger = new ExecutionLogger(runId, this.progressGateway, opts.projectId);
+
+    logger.info(0, `Starting execution: ${fields.length} steps to execute`);
+
+    // Launch browser: local or connect to remote Playwright server
+    let browser: any;
+    if (opts.executionTarget === 'server' && opts.serverWsEndpoint) {
+      logger.info(0, `Connecting to remote browser server: ${opts.serverWsEndpoint}`);
+      browser = await chromium.connect(opts.serverWsEndpoint);
+    } else {
+      logger.info(0, `Browser: Chromium (local) | Headless: ${isHeadless} | URL: ${opts.url}`);
+      browser = await chromium.launch({ headless: isHeadless, args: ['--no-sandbox', '--start-maximized'] });
+    }
+
+    const context = await browser.newContext({ viewport: isHeadless ? { width: 1280, height: 720 } : null });
+    const page = await context.newPage();
+
+    logger.info(0, 'Browser launched successfully');
+
+    const runDir = path.join(ARTIFACTS_DIR, `dynamic_${runId}`);
+    const ssMode = opts.screenshotMode || 'all';
+    if (ssMode !== 'none') {
+      fs.mkdirSync(runDir, { recursive: true });
+    }
+
+    const results: { step: number; field: string; action: string; status: string; screenshot?: string; error?: string; capturedValue?: string }[] = [];
+    const capturedVars: Record<string, string> = {};
+    let stepNum = 0;
+
+    try {
+      // Navigate to start URL with smart wait (network + jQuery + spinners)
+      logger.wait(1, `Navigating to ${opts.url}`, { details: 'Waiting for DOM + network idle + app ready (jQuery/spinners)' });
+      const navStart = Date.now();
+      await smartNavigate(page, opts.url, { timeout: 30000 });
+      stepNum++;
+      logger.success(stepNum, `Page loaded successfully`, { duration: Date.now() - navStart });
+
+      if (ssMode === 'all') {
+        const ssPath = path.join(runDir, `step_${stepNum}.png`);
+        await page.screenshot({ path: ssPath });
+        results.push({ step: stepNum, field: 'Navigation', action: `goto ${opts.url}`, status: 'PASSED', screenshot: `/api/live-test/screenshot/dynamic_${runId}/step_${stepNum}.png` });
+      } else {
+        results.push({ step: stepNum, field: 'Navigation', action: `goto ${opts.url}`, status: 'PASSED' });
+      }
+
+      // Login if credentials
+      if (opts.credentials) {
+        logger.info(stepNum + 1, 'Attempting login with provided credentials');
+        logger.wait(stepNum + 1, 'Waiting for login form to appear');
+        // Wait for login form to be ready (dynamic wait for input fields)
+        const userSelectors = ['input[type="email"]', 'input[type="text"]', 'input[name*="user"]', 'input[id*="user"]', 'input[id*="User"]'];
+        let userInput: any = null;
+        for (const sel of userSelectors) {
+          try {
+            await page.waitForSelector(sel, { state: 'visible', timeout: 5000 });
+            userInput = await page.$(sel);
+            if (userInput) break;
+          } catch {}
+        }
+        const passInput = await page.$('input[type="password"]');
+        if (userInput) {
+          await userInput.fill(opts.credentials.username);
+        }
+        if (passInput) {
+          await page.waitForSelector('input[type="password"]', { state: 'visible', timeout: 5000 });
+          await passInput.fill(opts.credentials.password);
+        }
+        const submit = await page.$('button[type="submit"], input[type="submit"], button:has-text("Login"), input[value*="Login"]');
+        if (submit) {
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
+            submit.click(),
+          ]);
+        }
+        // Wait for post-login page + app to become stable
+        logger.wait(stepNum + 1, 'Waiting for post-login page to stabilize');
+        const loginStart = Date.now();
+        await waitForPageStable(page, { timeout: 20000 });
+        stepNum++;
+        logger.success(stepNum, 'Login completed successfully', { duration: Date.now() - loginStart });
+        if (ssMode === 'all') {
+          await page.screenshot({ path: path.join(runDir, `step_${stepNum}.png`) });
+          results.push({ step: stepNum, field: 'Login', action: 'authenticate', status: 'PASSED', screenshot: `/api/live-test/screenshot/dynamic_${runId}/step_${stepNum}.png` });
+        } else {
+          results.push({ step: stepNum, field: 'Login', action: 'authenticate', status: 'PASSED' });
+        }
+      }
+
+      // Execute each field config as a step
+      for (const field of fields) {
+        // Check abort signal before each step
+        if (opts.shouldAbort?.()) {
+          logger.warn(stepNum + 1, 'Execution terminated by user');
+          const remaining = fields.length - results.length;
+          for (let i = 0; i < remaining; i++) {
+            results.push({ step: stepNum + 1 + i, field: 'TERMINATED', action: 'Terminated by user', status: 'SKIPPED' });
+          }
+          break;
+        }
+
+        // Check pause signal — hold until resumed or terminated
+        if (opts.shouldPause?.()) {
+          logger.info(stepNum + 1, 'Execution paused by user — waiting for resume...');
+          while (opts.shouldPause?.()) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            if (opts.shouldAbort?.()) break;
+          }
+          // After resume, re-check abort
+          if (opts.shouldAbort?.()) {
+            logger.warn(stepNum + 1, 'Execution terminated by user (while paused)');
+            const remaining = fields.length - results.length;
+            for (let i = 0; i < remaining; i++) {
+              results.push({ step: stepNum + 1 + i, field: 'TERMINATED', action: 'Terminated by user', status: 'SKIPPED' });
+            }
+            break;
+          }
+          logger.info(stepNum + 1, 'Execution resumed');
+        }
+
+        stepNum++;
+        const stepStart = Date.now();
+
+        // Skip login-related fields when credentials were already used to authenticate
+        if (opts.credentials && this.isLoginField(field)) {
+          logger.warn(stepNum, `Skipping "${field.label}" — already authenticated via credentials`);
+          results.push({ step: stepNum, field: field.label, action: `SKIPPED (already authenticated via credentials)`, status: 'SKIPPED' });
+          continue;
+        }
+
+        // Check conditions
+        if (field.conditions?.length) {
+          const condMet = field.conditions.every((c) => capturedVars[c.ref] === c.equals);
+          if (!condMet) {
+            logger.warn(stepNum, `Skipping "${field.label}" — condition not met: ${field.conditions[0].ref}=${field.conditions[0].equals}`);
+            results.push({ step: stepNum, field: field.label, action: `SKIPPED (condition: ${field.conditions[0].ref}=${field.conditions[0].equals})`, status: 'SKIPPED' });
+            continue;
+          }
+        }
+
+        logger.info(stepNum, `Step ${stepNum}/${fields.length + 1}: ${field.actionType} → "${field.label}"`, { selector: field.selector });
+
+        // Resolve value from testData or defaultValue
+        let value = opts.testData[field.fieldName] || field.defaultValue || '';
+        // Replace captured variables {{varName}}
+        for (const [k, v] of Object.entries(capturedVars)) {
+          value = value.replace(`{{${k}}}`, v);
+        }
+
+        try {
+          // APP-READINESS FIX: before EVERY step, wait for the app to be quiet —
+          // document complete, jQuery.active === 0, no visible spinners, held
+          // for a short quiet period. This is what stops values being filled
+          // while the page (or a dependent dropdown's AJAX) is still loading.
+          logger.wait(stepNum, `Waiting for app to be ready (pending AJAX / spinners)`);
+          await waitForAppReady(page, { timeout: 15000 });
+
+          // Determine the effective selector: prefer CSS, fall back to XPath
+          const cssSelector = field.selector || null;
+          const xpathSelector = (field as any).xpath || null;
+          const effectiveSelector = cssSelector || (xpathSelector ? `xpath=${xpathSelector}` : null);
+
+          // Find the correct context (main page or iframe) for this selector
+          logger.wait(stepNum, `Locating element context (checking main page + iframes)`, { selector: effectiveSelector || 'none' });
+          const ctx = effectiveSelector ? await getContextForSelector(page, cssSelector || `xpath=${xpathSelector}`, xpathSelector) : page;
+          // Resolve the best working selector (CSS or XPath fallback)
+          const sel = effectiveSelector ? await resolveSelector(ctx, cssSelector || `xpath=${xpathSelector}`, xpathSelector) : null;
+
+          if (sel && sel !== effectiveSelector) {
+            logger.info(stepNum, `Selector fallback: using XPath instead of CSS`, { selector: sel });
+          }
+
+          // Guard: actions that require a selector should fail clearly if none is available
+          const needsSelector = !['wait', 'goto', 'press', 'screenshot'].includes(field.actionType);
+          if (needsSelector && !sel) {
+            throw new Error(`No selector (CSS or XPath) configured for field "${field.label}"`);
+          }
+
+          // After the guard, sel is guaranteed non-null for actions that need it
+          const resolvedSel = sel as string;
+
+          switch (field.actionType) {
+            case 'fill':
+              logger.wait(stepNum, `Waiting for input "${field.label}" to be visible & editable`, { selector: resolvedSel });
+              await smartFill(ctx, resolvedSel, value, { timeout: 20000 });
+              logger.action(stepNum, `Filled "${field.label}" with value: "${value.slice(0, 50)}${value.length > 50 ? '...' : ''}"`, { selector: resolvedSel });
+              break;
+            case 'click':
+              logger.wait(stepNum, `Waiting for "${field.label}" to be visible & clickable`, { selector: resolvedSel });
+              await smartClick(ctx, page, resolvedSel, { timeout: 20000 });
+              logger.action(stepNum, `Clicked "${field.label}" — waiting for page to settle`, { selector: resolvedSel });
+              break;
+            case 'select':
+              logger.wait(stepNum, `Waiting for dropdown "${field.label}" to be ready (options may load via AJAX)`, { selector: resolvedSel });
+              await smartSelect(ctx, page, resolvedSel, value, { timeout: 20000 });
+              logger.action(stepNum, `Selected option "${value}" in "${field.label}"`, { selector: resolvedSel });
+              break;
+            case 'check': {
+              logger.wait(stepNum, `Waiting for checkbox "${field.label}" to be visible`, { selector: resolvedSel });
+              const el = await waitForElementReady(ctx, resolvedSel, { timeout: 20000 });
+              await el.check({ timeout: 10000 });
+              logger.action(stepNum, `Checked "${field.label}"`, { selector: resolvedSel });
+              break;
+            }
+            case 'hover': {
+              logger.wait(stepNum, `Waiting for "${field.label}" to be visible for hover`, { selector: resolvedSel });
+              const el = await waitForElementReady(ctx, resolvedSel, { timeout: 20000 });
+              await el.hover({ timeout: 10000 });
+              logger.action(stepNum, `Hovered over "${field.label}" — waiting for effects to render`, { selector: resolvedSel });
+              // Wait for hover effects (tooltips, dropdowns) to render
+              await waitForPageStable(page, { timeout: 5000 });
+              break;
+            }
+            case 'press':
+              if (resolvedSel && resolvedSel !== 'body') {
+                logger.wait(stepNum, `Waiting for element to be ready before pressing "${value || 'Enter'}"`, { selector: resolvedSel });
+                const el = await waitForElementReady(ctx, resolvedSel, { timeout: 15000 });
+                await el.press(value || 'Enter');
+              } else {
+                await ctx.press(resolvedSel || 'body', value || 'Enter');
+              }
+              logger.action(stepNum, `Pressed key "${value || 'Enter'}"`, { selector: resolvedSel });
+              await waitForPageStable(page, { timeout: 8000 });
+              break;
+            case 'wait':
+              // Dynamic wait: if value is a selector, wait for it; if number, use as timeout
+              if (value && isNaN(Number(value))) {
+                logger.wait(stepNum, `Waiting for element to appear: "${value}"`);
+                await firstVisibleElement(ctx, value, 30000);
+                logger.action(stepNum, `Element appeared: "${value}"`);
+              } else {
+                const waitMs = parseInt(value || '2000');
+                if (waitMs <= 1000) {
+                  logger.wait(stepNum, `Waiting for page to stabilize`);
+                  await waitForPageStable(page, { timeout: 8000 });
+                } else {
+                  logger.wait(stepNum, `Explicit wait: ${waitMs}ms`);
+                  await page.waitForTimeout(waitMs);
+                }
+                logger.action(stepNum, `Wait completed`);
+              }
+              break;
+            case 'goto':
+              logger.wait(stepNum, `Navigating to: ${value}`);
+              await smartNavigate(page, value, { timeout: 30000 });
+              logger.action(stepNum, `Navigation complete: ${value}`);
+              break;
+            case 'clickIfVisible': {
+              logger.info(stepNum, `Checking if "${field.label}" is visible before clicking`, { selector: resolvedSel });
+              try {
+                // Wizard-safe: pick the first VISIBLE match (short timeout — this
+                // action is intentionally optional)
+                const el = await firstVisibleElement(ctx, resolvedSel, 3000).catch(() => null);
+                if (el) {
+                  await el.click({ timeout: 5000 });
+                  logger.action(stepNum, `Element was visible — clicked "${field.label}"`, { selector: resolvedSel });
+                } else {
+                  logger.info(stepNum, `Element not visible — skipping click`, { selector: resolvedSel });
+                }
+              } catch {}
+              break;
+            }
+            case 'uploadFile': {
+              logger.wait(stepNum, `Waiting for file input "${field.label}" to be attached`, { selector: resolvedSel });
+              const el = await waitForElementReady(ctx, resolvedSel, { timeout: 20000, state: 'attached' });
+              await el.setInputFiles(value);
+              logger.action(stepNum, `Uploaded file: "${value}"`, { selector: resolvedSel });
+              break;
+            }
+            case 'dblclick': {
+              logger.wait(stepNum, `Waiting for "${field.label}" to be visible for double-click`, { selector: resolvedSel });
+              const el = await waitForElementReady(ctx, resolvedSel, { timeout: 20000 });
+              await el.dblclick({ timeout: 10000 });
+              logger.action(stepNum, `Double-clicked "${field.label}"`, { selector: resolvedSel });
+              await waitForPageStable(page, { timeout: 8000 });
+              break;
+            }
+            case 'scroll':
+              logger.info(stepNum, `Scrolling to "${field.label}"`, { selector: resolvedSel });
+              if (resolvedSel && resolvedSel !== 'html') {
+                try { await waitForElementReady(ctx, resolvedSel, { timeout: 10000, state: 'attached' }); } catch {}
+              }
+              await ctx.evaluate((s: string) => {
+                const el = document.querySelector(s) || document.evaluate(s.replace('xpath=', ''), document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                if (el) (el as Element).scrollIntoView({ behavior: 'smooth' });
+                else window.scrollBy(0, 300);
+              }, resolvedSel);
+              // Brief stability wait after scroll for lazy-loaded content
+              await waitForPageStable(page, { timeout: 5000 });
+              break;
+            case 'assert': {
+              // Wizard-safe: assert against the visible match when there are several
+              const el = await waitForElementReady(ctx, resolvedSel, { timeout: 20000 }).catch(() => null);
+              let passed = false;
+              if (field.assertType === 'visible') passed = !!el;
+              else if (field.assertType === 'hidden') passed = !el;
+              else if (el) {
+                if (field.assertType === 'hasText') passed = ((await el.textContent()) || '').includes(field.expectedValue);
+                else if (field.assertType === 'hasValue') passed = (await el.inputValue()) === field.expectedValue;
+                else if (field.assertType === 'containsText') passed = ((await el.textContent()) || '').includes(field.expectedValue);
+                else if (field.assertType === 'enabled') passed = await el.isEnabled();
+                else if (field.assertType === 'disabled') passed = !(await el.isEnabled());
+              }
+              if (!passed) throw new Error(`Assertion failed: ${field.assertType} on ${resolvedSel}`);
+              logger.action(stepNum, `Assertion passed: ${field.assertType} = "${field.expectedValue}"`, { selector: resolvedSel });
+              break;
+            }
+            case 'captureAppNumber': {
+              logger.wait(stepNum, `Waiting for element to capture value from "${field.label}"`, { selector: resolvedSel });
+              const el = await waitForElementReady(ctx, resolvedSel, { timeout: 20000 });
+              const text = await el.textContent();
+              if (text && field.captureAs) {
+                capturedVars[field.captureAs] = text.trim();
+                logger.action(stepNum, `Captured "${field.captureAs}" = "${text.trim()}"`, { selector: resolvedSel });
+              }
+              break;
+            }
+            case 'screenshot':
+              logger.action(stepNum, `Taking screenshot`);
+              break; // screenshot taken below anyway
+          }
+
+          // Capture value if captureAs is set
+          if (field.captureAs && field.actionType !== 'captureAppNumber') {
+            try {
+              const el = await firstVisibleElement(ctx, resolvedSel, 3000).catch(() => null);
+              const val = el ? await el.inputValue().catch(() => '') : '';
+              if (val) {
+                capturedVars[field.captureAs] = val;
+                logger.info(stepNum, `Captured variable "${field.captureAs}" = "${val}"`);
+              }
+            } catch {}
+          }
+
+          const stepDuration = Date.now() - stepStart;
+          logger.success(stepNum, `✓ Step ${stepNum} passed: ${field.actionType} → "${field.label}" (${stepDuration}ms)`, { duration: stepDuration });
+
+          if (ssMode === 'all') {
+            const ss = path.join(runDir, `step_${stepNum}.png`);
+            await page.screenshot({ path: ss });
+            results.push({ step: stepNum, field: field.label, action: `${field.actionType}: ${value || field.selector}`, status: 'PASSED', screenshot: `/api/live-test/screenshot/dynamic_${runId}/step_${stepNum}.png`, capturedValue: field.captureAs ? capturedVars[field.captureAs] : undefined });
+          } else {
+            results.push({ step: stepNum, field: field.label, action: `${field.actionType}: ${value || field.selector}`, status: 'PASSED', capturedValue: field.captureAs ? capturedVars[field.captureAs] : undefined });
+          }
+          this.progressGateway?.emitProgress(opts.runId || runId, { step: stepNum, total: fields.length + 1, action: field.label, status: 'passed' });
+          if (opts.projectId) this.progressGateway?.emitProgress(opts.projectId, { step: stepNum, total: fields.length + 1, action: field.label, status: 'passed' });
+
+        } catch (err: any) {
+          const stepDuration = Date.now() - stepStart;
+          logger.error(stepNum, `✗ Step ${stepNum} failed: ${field.actionType} → "${field.label}" (${stepDuration}ms)`, { selector: field.selector, details: formatError(err.message) });
+
+          if (ssMode !== 'none') {
+            const ss = path.join(runDir, `step_${stepNum}_fail.png`);
+            try { await page.screenshot({ path: ss }); } catch {}
+            results.push({ step: stepNum, field: field.label, action: `${field.actionType}: ${value || field.selector}`, status: 'FAILED', error: formatError(err.message), screenshot: `/api/live-test/screenshot/dynamic_${runId}/step_${stepNum}_fail.png` });
+          } else {
+            results.push({ step: stepNum, field: field.label, action: `${field.actionType}: ${value || field.selector}`, status: 'FAILED', error: formatError(err.message) });
+          }
+          this.progressGateway?.emitProgress(opts.runId || runId, { step: stepNum, total: fields.length + 1, action: field.label, status: 'failed' });
+          if (opts.projectId) this.progressGateway?.emitProgress(opts.projectId, { step: stepNum, total: fields.length + 1, action: field.label, status: 'failed' });
+        }
+      }
+    } catch (err: any) {
+      logger.error(stepNum + 1, `FATAL ERROR: ${err.message}`);
+      results.push({ step: stepNum + 1, field: 'FATAL', action: 'execution', status: 'FAILED', error: err.message });
+    }
+
+    // In 'final' mode, capture the last step screenshot (final state or last failure)
+    if (ssMode === 'final' && results.length > 0) {
+      const lastResult = results[results.length - 1];
+      const lastStepNum = lastResult.step;
+      const suffix = lastResult.status === 'FAILED' ? '_fail' : '';
+      const ss = path.join(runDir, `step_${lastStepNum}${suffix}.png`);
+      try {
+        await page.screenshot({ path: ss });
+        lastResult.screenshot = `/api/live-test/screenshot/dynamic_${runId}/step_${lastStepNum}${suffix}.png`;
+      } catch {}
+    }
+
+    // Wait for page to settle before closing
+    await waitForPageStable(page, { timeout: 5000 });
+    await browser.close();
+
+    // Resolve script name from linked test case
+    const testCase = await this.testCaseModel.findOne({
+      projectId: new Types.ObjectId(opts.projectId),
+      tags: 'field-config',
+      isDeleted: { $ne: true },
+    }).lean();
+    const scriptName = testCase?.title || null;
+
+    const totalDuration = logger.getElapsed();
+    const passedCount = results.filter((r) => r.status === 'PASSED').length;
+    const failedCount = results.filter((r) => r.status === 'FAILED').length;
+    const skippedCount = results.filter((r) => r.status === 'SKIPPED').length;
+
+    logger.info(0, `Execution complete: ${passedCount} passed, ${failedCount} failed, ${skippedCount} skipped (${totalDuration}ms total)`);
+
+    // Notify all WebSocket watchers that execution is done
+    this.progressGateway?.emitComplete(runId, { passed: passedCount, failed: failedCount, skipped: skippedCount, duration: totalDuration, totalSteps: results.length });
+    if (opts.projectId) this.progressGateway?.emitComplete(opts.projectId, { passed: passedCount, failed: failedCount, skipped: skippedCount, duration: totalDuration, totalSteps: results.length });
+
+    const executionResult = {
+      runId,
+      scriptName,
+      testCaseId: testCase?._id || null,
+      screenshotMode: ssMode,
+      totalSteps: results.length,
+      passed: passedCount,
+      failed: failedCount,
+      skipped: skippedCount,
+      duration: totalDuration,
+      capturedVariables: capturedVars,
+      results,
+      logs: logger.getAllLogs(),
+    };
+
+    // Auto-generate HTML report after execution
+    try {
+      this.htmlReportService?.generateReport({
+        runId,
+        totalSteps: executionResult.totalSteps,
+        passed: executionResult.passed,
+        failed: executionResult.failed,
+        skipped: executionResult.skipped,
+        results,
+        projectId: opts.projectId,
+        url: opts.url,
+        executedAt: new Date().toISOString(),
+      });
+    } catch {}
+
+    return {
+      ...executionResult,
+      reportUrl: `/api/html-report/download/${runId}`,
+    };
+  }
+
+  /**
+   * Detect if a field config is a login-related step that should be skipped
+   * when credentials are already provided for automatic login.
+   */
+  private isLoginField(field: any): boolean {
+    const sectionLower = (field.section || '').toLowerCase();
+    const labelLower = (field.label || '').toLowerCase();
+    const fieldNameLower = (field.fieldName || '').toLowerCase();
+    const selectorLower = (field.selector || '').toLowerCase();
+
+    // Check section name
+    if (sectionLower === 'login' || sectionLower === 'authentication' || sectionLower === 'auth') {
+      return true;
+    }
+
+    // Check if it's a password input type
+    if (field.inputType === 'password') {
+      return true;
+    }
+
+    // Check field name / label patterns
+    const loginPatterns = ['login', 'password', 'username', 'signin', 'sign-in', 'sign_in'];
+    if (loginPatterns.some(p => fieldNameLower.includes(p) || labelLower.includes(p))) {
+      return true;
+    }
+
+    // Check selector patterns for login elements
+    if (selectorLower.includes('login') || selectorLower.includes('password') ||
+        selectorLower.includes('btnlogin') || selectorLower.includes('btn-login') ||
+        selectorLower.includes('input[type="password"]')) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Preview steps without executing (dry run).
+   * Returns the script name from the linked test case so Record & Run
+   * displays the same name pattern as the Test Cases section.
+   */
+  async previewSteps(projectId: string) {
+    const pid = new Types.ObjectId(projectId);
+
+    const fields = await this.fieldModel.find({
+      projectId: pid, isActive: true, isSkipped: false,
+    }).sort({ order: 1 }).lean();
+
+    // Resolve script name from the linked test case
+    const testCase = await this.testCaseModel.findOne({
+      projectId: pid,
+      tags: 'field-config',
+      isDeleted: { $ne: true },
+    }).lean();
+
+    const scriptName = testCase?.title || null;
+
+    const steps = fields.map((f: any, i: number) => ({
+      step: i + 1,
+      label: f.label,
+      action: f.actionType,
+      selector: f.selector,
+      defaultValue: f.defaultValue,
+      conditions: f.conditions,
+      captureAs: f.captureAs,
+    }));
+
+    return {
+      scriptName,
+      testCaseId: testCase?._id || null,
+      totalSteps: steps.length,
+      steps,
+    };
+  }
+}
