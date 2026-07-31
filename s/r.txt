@@ -1,0 +1,148 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+ * RECORDER FIX — deterministic filtering of programmatic "copy address" changes
+ *
+ * REPLACE the block in your addInitScript that currently starts at:
+ *
+ *     let lastUserGestureTs = 0;
+ *     let lastGestureInWidgetUi = false;
+ *     const touchedNodes: any = ...
+ *     function markUserGesture(e: any) { ... }
+ *     document.addEventListener("pointerdown", markUserGesture, true);
+ *     document.addEventListener("keydown", markUserGesture, true);
+ *     function isUserInitiatedChange(el: any, nativeEvent: any): boolean { ... }
+ *
+ * ...with EVERYTHING below (same names, drop-in). Nothing else in the
+ * recorder needs to change.
+ *
+ * WHY: the old touchedNodes walk marked the clicked element + 25 ancestors —
+ * which includes <form>, <body>, <html>. Every field in the page shares
+ * <body>, so programmatic bulk-copy changes fired within 1.5s of the
+ * "Same as Address" click leaked through the gate for SHALLOW fields, while
+ * DEEPLY nested fields (wizard panels) missed the marked ancestor inside the
+ * 25-level cap and were dropped. Result: a half-recorded, half-empty set of
+ * permanent-address steps → FieldConfigs with empty values → replay wiped
+ * the copied data. The walk now STOPS at FORM/BODY/HTML in both directions,
+ * and clicks on "Same as / Copy"-style controls open a grace window during
+ * which ALL untrusted change events are consistently filtered.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+let lastUserGestureTs = 0;
+let lastGestureInWidgetUi = false;
+// Timestamp of the last click on a "Same as Address"/"Copy" style control.
+// The app's bulk-copy fires programmatic change events right after this
+// click — those must NEVER be recorded (replay's copy-click repopulates
+// them, and the replay engine keeps app-populated values).
+let copyControlClickTs = 0;
+const touchedNodes: any =
+  typeof WeakSet !== "undefined" ? new WeakSet() : null;
+
+// Structural containers must not count as "touched" — marking them made the
+// whole document pass the gate for 1.5s after any click.
+function isStructuralNode(n: any): boolean {
+  const tag = n && n.tagName;
+  return tag === "FORM" || tag === "BODY" || tag === "HTML";
+}
+
+// Heuristic: does this element (checkbox, button, its label/wrapper) look
+// like a "Same as Address" / "Copy address" control?
+function looksLikeCopyControl(el: any): boolean {
+  try {
+    const txt = (
+      (el.innerText || "") +
+      " " +
+      (el.id || "") +
+      " " +
+      (el.getAttribute("name") || "") +
+      " " +
+      (typeof el.className === "string" ? el.className : "")
+    ).toLowerCase();
+    return /same\s*as|sameas|copy\s*addr|copyaddress|same\s*address/.test(txt);
+  } catch {
+    return false;
+  }
+}
+
+function markUserGesture(e: any) {
+  if (!e.isTrusted) return;
+  lastUserGestureTs = Date.now();
+  try {
+    lastGestureInWidgetUi = !!(
+      e.target &&
+      e.target.closest &&
+      e.target.closest(
+        ".select2-container, .select2-dropdown, .bootstrap-select, " +
+          ".chosen-container, .ui-selectmenu-menu, .ui-selectmenu-button, " +
+          ".datepicker, .daterangepicker, .flatpickr-calendar, " +
+          ".ui-datepicker, .bootstrap-datetimepicker-widget, .dropdown-menu",
+      )
+    );
+  } catch {
+    lastGestureInWidgetUi = false;
+  }
+
+  // Detect clicks on copy-style controls (checkbox, its <label>, or a button)
+  // and open the programmatic-change grace window.
+  try {
+    let n = e.target;
+    let d = 0;
+    while (n && n.nodeType === 1 && d++ < 6 && !isStructuralNode(n)) {
+      if (looksLikeCopyControl(n)) {
+        copyControlClickTs = Date.now();
+        break;
+      }
+      n = n.parentElement;
+    }
+  } catch {}
+
+  // Mark the touched element + ancestors — but STOP before FORM/BODY/HTML so
+  // the mark stays local to the widget/field group the user actually touched.
+  if (touchedNodes) {
+    let n = e.target;
+    let depth = 0;
+    while (n && n.nodeType === 1 && depth++ < 25) {
+      if (isStructuralNode(n)) break;
+      touchedNodes.add(n);
+      n = n.parentElement;
+    }
+  }
+}
+document.addEventListener("pointerdown", markUserGesture, true);
+document.addEventListener("keydown", markUserGesture, true);
+
+function isUserInitiatedChange(el: any, nativeEvent: any): boolean {
+  // Trusted native event → always the user.
+  if (nativeEvent && nativeEvent.isTrusted) return true;
+
+  // Untrusted change inside the copy grace window → it's the app's bulk copy
+  // ("Same as Address"). Filter it CONSISTENTLY — the recorded copy-click
+  // will repopulate these fields on replay, and the execution engine keeps
+  // app-populated values when no test data is supplied.
+  if (Date.now() - copyControlClickTs < 2500) return false;
+
+  if (Date.now() - lastUserGestureTs > 1500) return false;
+  if (!touchedNodes) return true;
+
+  // Walk up from the changed element, stopping at structural containers —
+  // the old walk could reach <body> (always "touched") and leak through.
+  let n = el;
+  let depth = 0;
+  while (n && n.nodeType === 1 && depth++ < 25) {
+    if (touchedNodes.has(n)) return true;
+    if (isStructuralNode(n)) break;
+    n = n.parentElement;
+  }
+
+  // Enhanced-select widgets render as a SIBLING of the hidden <select>
+  const sib = el.nextElementSibling;
+  if (
+    sib &&
+    /select2|chosen|ui-selectmenu/i.test(sib.className || "") &&
+    touchedNodes.has(sib)
+  )
+    return true;
+
+  // Gesture happened inside a widget's own UI (body-appended dropdown,
+  // datepicker calendar, etc.) → the resulting change is user-driven.
+  if (lastGestureInWidgetUi) return true;
+  return false;
+}
